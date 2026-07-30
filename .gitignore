@@ -1,0 +1,6 @@
+venv/**
+venv
+.env
+MT5_Monitoring_Project_Specification.docx
+pycache
+**/pycache/**

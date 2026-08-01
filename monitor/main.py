@@ -29,6 +29,8 @@ class TradeMonitor:
             chat_ids=settings.telegram_chat_ids,
             logger=self.logger,
             error_logger=self.error_logger,
+            ack_remind_seconds=settings.ack_remind_seconds,
+            ack_max_reminders=settings.ack_max_reminders,
         )
         # login -> ticket -> last known open position
         self._known_positions: dict[int, dict[int, PositionSnapshot]] = defaultdict(dict)
@@ -132,9 +134,11 @@ class TradeMonitor:
     def run(self) -> None:
         self.logger.info("MT5 Trade Monitor starting...")
         self.logger.info(
-            "Poll interval: %ss | Accounts: %s",
+            "Poll interval: %ss | Accounts: %s | Seen remind: %ss (max %s)",
             self.settings.poll_interval_seconds,
             len(self.settings.accounts),
+            self.settings.ack_remind_seconds,
+            self.settings.ack_max_reminders,
         )
 
         first_account = self.settings.accounts[0]
@@ -167,18 +171,29 @@ class TradeMonitor:
 
         poll_count = 0
         while self._running:
+            self.notifier.process_acknowledgements()
+            self.notifier.remind_unacknowledged()
+
             for account in self._active_accounts:
                 if not self._running:
                     break
                 if not self._ensure_connection(account):
                     break
                 self._poll_account(account)
+                self.notifier.process_acknowledgements()
 
             poll_count += 1
             if poll_count % 20 == 0:
                 self.logger.info("Health check: monitor running normally.")
 
-            time.sleep(self.settings.poll_interval_seconds)
+            # Short sleep slices so Seen clicks and reminders stay responsive
+            slept = 0.0
+            slice_sec = min(1.0, self.settings.poll_interval_seconds)
+            while self._running and slept < self.settings.poll_interval_seconds:
+                time.sleep(slice_sec)
+                slept += slice_sec
+                self.notifier.process_acknowledgements()
+                self.notifier.remind_unacknowledged()
 
         self.mt5.disconnect()
         self.logger.info("MT5 Trade Monitor stopped.")

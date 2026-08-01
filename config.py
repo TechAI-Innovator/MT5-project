@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / "logs"
-MAX_ACCOUNTS = 5
+MAX_ACCOUNTS = 50
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,8 @@ class Settings:
     telegram_chat_ids: tuple[str, ...]
     mt5_terminal_path: str | None
     accounts: tuple[AccountConfig, ...]
+    ack_remind_seconds: float
+    ack_max_reminders: int
 
 
 def load_settings(env_path: Path | None = None) -> Settings:
@@ -85,10 +87,20 @@ def load_settings(env_path: Path | None = None) -> Settings:
 
     terminal_path = os.getenv("MT5_TERMINAL_PATH", "").strip() or None
 
+    ack_remind = float(os.getenv("ACK_REMIND_SECONDS", "30").strip() or "30")
+    if ack_remind < 5:
+        raise ValueError("ACK_REMIND_SECONDS must be at least 5 seconds.")
+
+    ack_max = int(os.getenv("ACK_MAX_REMINDERS", "5").strip() or "5")
+    if ack_max < 0:
+        raise ValueError("ACK_MAX_REMINDERS must be 0 or greater.")
+
     return Settings(
         poll_interval_seconds=poll_interval,
         telegram_bot_token=bot_token,
         telegram_chat_ids=chat_ids,
         mt5_terminal_path=terminal_path,
         accounts=tuple(accounts),
+        ack_remind_seconds=ack_remind,
+        ack_max_reminders=ack_max,
     )

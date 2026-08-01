@@ -2,5 +2,9 @@ venv/**
 venv
 .env
 MT5_Monitoring_Project_Specification.docx
-pycache
+__pycache__
 **/pycache/**
+Default.rdp
+nifesimi aws.pem
+__pycache__/**
+Login Details.txt

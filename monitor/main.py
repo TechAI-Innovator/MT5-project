@@ -44,9 +44,6 @@ class TradeMonitor:
 
     def _ensure_connection(self, account: AccountConfig | None = None) -> bool:
         terminal_path = account.terminal_path if account else None
-        if self.mt5.is_connected:
-            return True
-
         self.logger.info("Attempting MT5 connection...")
         if self.mt5.connect(terminal_path):
             self._reconnect_delay = 5
@@ -70,6 +67,13 @@ class TradeMonitor:
             return False
 
         positions = self.mt5.get_open_positions()
+        if positions is None:
+            self.error_logger.error(
+                "Could not read baseline positions for %s — skipping account.",
+                account.label,
+            )
+            return False
+
         self._known_positions[account.login] = {p.ticket: p for p in positions}
         self.logger.info(
             "Baseline for %s: %s open position(s)",
@@ -94,9 +98,18 @@ class TradeMonitor:
 
     def _poll_account(self, account: AccountConfig) -> None:
         if not self.mt5.login(account):
+            # Do not mutate known positions on failed/partial login
             return
 
         positions = self.mt5.get_open_positions()
+        if positions is None:
+            # Unreliable read — keep previous known set, send no alerts
+            self.logger.warning(
+                "Skipping poll for %s — position read unreliable.",
+                account.label,
+            )
+            return
+
         opened, closed = self._detect_opened_and_closed(account, positions)
 
         for position in opened:
@@ -112,6 +125,19 @@ class TradeMonitor:
         for previous in closed:
             try:
                 closed_trade = self.mt5.get_closed_trade(previous)
+                if closed_trade is None:
+                    # Position disappeared but history has no exit deal —
+                    # likely a sync glitch from account switching. Keep watching.
+                    self.logger.warning(
+                        "Ignored unconfirmed close for ticket %s on %s "
+                        "(no exit deal in history).",
+                        previous.ticket,
+                        account.label,
+                    )
+                    # Put ticket back so we don't spam "new open" next cycle
+                    self._known_positions[account.login][previous.ticket] = previous
+                    continue
+
                 self.logger.info(
                     "Trade closed on %s: ticket %s %s %s profit=%s",
                     account.label,

@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import time
 
 import MetaTrader5 as mt5
 
@@ -148,6 +149,18 @@ class MT5Client:
             )
             return False
 
+        # Brief settle time after account switch (avoids stale/empty position reads)
+        time.sleep(0.35)
+        info = mt5.account_info()
+        if info is None or int(info.login) != int(account.login):
+            self._error_logger.error(
+                "MT5 login mismatch for %s: expected %s, got %s",
+                account.label,
+                account.login,
+                getattr(info, "login", None),
+            )
+            return False
+
         self._logger.info(
             "Logged in to %s (%s) via %s",
             account.label,
@@ -156,13 +169,13 @@ class MT5Client:
         )
         return True
 
-    def get_open_positions(self) -> list[PositionSnapshot]:
+    def get_open_positions(self) -> list[PositionSnapshot] | None:
+        """Return open positions, or None if the read is unreliable."""
         raw_positions = mt5.positions_get()
         if raw_positions is None:
             error = mt5.last_error()
-            if error[0] != 1:
-                self._error_logger.error("positions_get failed: %s", error)
-            return []
+            self._error_logger.error("positions_get failed: %s", error)
+            return None
 
         snapshots: list[PositionSnapshot] = []
         for pos in raw_positions:
@@ -184,14 +197,13 @@ class MT5Client:
         self,
         position: PositionSnapshot,
         lookback_days: int = 7,
-    ) -> ClosedTradeSnapshot:
-        """Build a closed-trade snapshot from deal history when possible."""
+    ) -> ClosedTradeSnapshot | None:
+        """Return a confirmed closed trade from deal history, else None."""
         now = datetime.now(timezone.utc)
         date_from = now - timedelta(days=lookback_days)
 
         deals = mt5.history_deals_get(position=position.ticket)
         if deals is None or len(deals) == 0:
-            # Fallback: scan recent history and match by position id
             deals = mt5.history_deals_get(date_from, now)
             if deals is None:
                 self._error_logger.error(
@@ -199,27 +211,33 @@ class MT5Client:
                     position.ticket,
                     mt5.last_error(),
                 )
-                return self._fallback_closed_trade(position)
+                return None
             deals = [d for d in deals if getattr(d, "position_id", 0) == position.ticket]
 
         if not deals:
-            return self._fallback_closed_trade(position)
+            return None
 
-        close_price = position.open_price
+        close_price = None
         close_time = now
         profit = 0.0
         commission = 0.0
         swap = 0.0
         volume = position.volume
+        saw_exit = False
 
         for deal in deals:
             commission += float(deal.commission)
             swap += float(deal.swap)
             profit += float(deal.profit)
             if deal.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_OUT_BY):
+                saw_exit = True
                 close_price = float(deal.price)
                 close_time = datetime.fromtimestamp(deal.time, tz=timezone.utc)
                 volume = float(deal.volume)
+
+        # Only alert when MT5 history confirms an exit deal
+        if not saw_exit or close_price is None:
+            return None
 
         return ClosedTradeSnapshot(
             ticket=position.ticket,
@@ -233,18 +251,4 @@ class MT5Client:
             close_time=close_time,
             commission=commission,
             swap=swap,
-        )
-
-    def _fallback_closed_trade(self, position: PositionSnapshot) -> ClosedTradeSnapshot:
-        now = datetime.now(timezone.utc)
-        return ClosedTradeSnapshot(
-            ticket=position.ticket,
-            symbol=position.symbol,
-            trade_type=position.trade_type,
-            volume=position.volume,
-            open_price=position.open_price,
-            close_price=position.open_price,
-            profit=0.0,
-            open_time=position.open_time,
-            close_time=now,
         )

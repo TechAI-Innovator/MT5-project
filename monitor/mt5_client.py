@@ -133,41 +133,55 @@ class MT5Client:
         if not self.connect(account.terminal_path):
             return False
 
-        authorized = mt5.login(
-            login=account.login,
-            password=account.password,
-            server=account.server,
-        )
-        if not authorized:
-            error = mt5.last_error()
-            self._error_logger.error(
-                "MT5 login failed for %s (%s) on server '%s': %s",
-                account.label,
-                account.login,
-                account.server,
-                error,
-            )
-            return False
+        # Already on the requested account — skip redundant switch
+        current = mt5.account_info()
+        if current is not None and int(current.login) == int(account.login):
+            return True
 
-        # Brief settle time after account switch (avoids stale/empty position reads)
-        time.sleep(0.35)
-        info = mt5.account_info()
-        if info is None or int(info.login) != int(account.login):
-            self._error_logger.error(
-                "MT5 login mismatch for %s: expected %s, got %s",
-                account.label,
-                account.login,
-                getattr(info, "login", None),
+        for attempt in range(1, 4):
+            authorized = mt5.login(
+                login=account.login,
+                password=account.password,
+                server=account.server,
             )
-            return False
+            if not authorized:
+                error = mt5.last_error()
+                self._error_logger.error(
+                    "MT5 login failed for %s (%s) on server '%s': %s",
+                    account.label,
+                    account.login,
+                    account.server,
+                    error,
+                )
+                return False
 
-        self._logger.info(
-            "Logged in to %s (%s) via %s",
+            # Wait until account_info reflects the switch (MT5 can lag under load)
+            for _ in range(15):
+                time.sleep(0.25)
+                info = mt5.account_info()
+                if info is not None and int(info.login) == int(account.login):
+                    self._logger.info(
+                        "Logged in to %s (%s) via %s",
+                        account.label,
+                        account.login,
+                        account.server,
+                    )
+                    return True
+
+            self._logger.warning(
+                "Login switch pending for %s (attempt %s/3): still on %s",
+                account.label,
+                attempt,
+                getattr(mt5.account_info(), "login", None),
+            )
+
+        self._error_logger.error(
+            "MT5 login mismatch for %s: expected %s, got %s",
             account.label,
             account.login,
-            account.server,
+            getattr(mt5.account_info(), "login", None),
         )
-        return True
+        return False
 
     def get_open_positions(self) -> list[PositionSnapshot] | None:
         """Return open positions, or None if the read is unreliable."""

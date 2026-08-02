@@ -56,7 +56,13 @@ class TelegramNotifier:
             data = response.json()
             if not response.ok or not data.get("ok"):
                 detail = data.get("description", response.text)
-                self._error_logger.error("Telegram %s failed: %s", method, detail)
+                if "Conflict" in str(detail) and "getUpdates" in str(detail):
+                    self._error_logger.error(
+                        "Telegram getUpdates conflict: another monitor instance "
+                        "is using this bot. Stop all other python/monitor processes."
+                    )
+                else:
+                    self._error_logger.error("Telegram %s failed: %s", method, detail)
                 return None
             return data.get("result")
         except (requests.RequestException, ValueError) as exc:

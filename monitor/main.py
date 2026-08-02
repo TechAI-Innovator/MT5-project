@@ -10,6 +10,7 @@ import time
 from collections import defaultdict
 
 from config import AccountConfig, Settings, load_settings
+from monitor.instance_lock import acquire_lock, release_lock
 from monitor.logger_setup import log_error, setup_logging
 from monitor.mt5_client import MT5Client, PositionSnapshot
 from monitor.notifier import TelegramNotifier
@@ -44,7 +45,6 @@ class TradeMonitor:
 
     def _ensure_connection(self, account: AccountConfig | None = None) -> bool:
         terminal_path = account.terminal_path if account else None
-        self.logger.info("Attempting MT5 connection...")
         if self.mt5.connect(terminal_path):
             self._reconnect_delay = 5
             return True
@@ -103,7 +103,6 @@ class TradeMonitor:
 
         positions = self.mt5.get_open_positions()
         if positions is None:
-            # Unreliable read — keep previous known set, send no alerts
             self.logger.warning(
                 "Skipping poll for %s — position read unreliable.",
                 account.label,
@@ -126,15 +125,12 @@ class TradeMonitor:
             try:
                 closed_trade = self.mt5.get_closed_trade(previous)
                 if closed_trade is None:
-                    # Position disappeared but history has no exit deal —
-                    # likely a sync glitch from account switching. Keep watching.
                     self.logger.warning(
                         "Ignored unconfirmed close for ticket %s on %s "
                         "(no exit deal in history).",
                         previous.ticket,
                         account.label,
                     )
-                    # Put ticket back so we don't spam "new open" next cycle
                     self._known_positions[account.login][previous.ticket] = previous
                     continue
 
@@ -203,8 +199,7 @@ class TradeMonitor:
             for account in self._active_accounts:
                 if not self._running:
                     break
-                if not self._ensure_connection(account):
-                    break
+                # login() connects/switches account; no need to re-init each time
                 self._poll_account(account)
                 self.notifier.process_acknowledgements()
 
@@ -293,6 +288,9 @@ def main() -> None:
         print(f"Configuration error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    if not args.test and not acquire_lock():
+        sys.exit(2)
+
     monitor = TradeMonitor(settings)
 
     def handle_signal(signum: int, _frame: object) -> None:
@@ -311,6 +309,8 @@ def main() -> None:
         log_error(monitor.error_logger, "Unhandled monitor error", exc)
         monitor.mt5.disconnect()
         sys.exit(1)
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":

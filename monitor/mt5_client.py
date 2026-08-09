@@ -160,7 +160,7 @@ class MT5Client:
                 time.sleep(0.25)
                 info = mt5.account_info()
                 if info is not None and int(info.login) == int(account.login):
-                    self._logger.info(
+                    self._logger.debug(
                         "Logged in to %s (%s) via %s",
                         account.label,
                         account.login,

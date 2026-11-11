@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import requests
 
 from monitor.mt5_client import ClosedTradeSnapshot, PositionSnapshot
+
+
+StatusProvider = Callable[[], str]
 
 
 @dataclass
@@ -46,6 +50,11 @@ class TelegramNotifier:
         self._ack_max_reminders = ack_max_reminders
         self._pending: dict[str, PendingOpenAlert] = {}
         self._update_offset: int | None = None
+        self._status_provider: StatusProvider | None = None
+        self._allowed_chat_ids = {str(cid) for cid in self._chat_ids}
+
+    def set_status_provider(self, provider: StatusProvider) -> None:
+        self._status_provider = provider
 
     def _url(self, method: str) -> str:
         return self.API_BASE.format(token=self._bot_token, method=method)
@@ -73,9 +82,11 @@ class TelegramNotifier:
         self,
         text: str,
         reply_markup: dict | None = None,
+        chat_ids: list[str] | tuple[str, ...] | None = None,
     ) -> list[tuple[str, int]]:
         refs: list[tuple[str, int]] = []
-        for chat_id in self._chat_ids:
+        targets = tuple(chat_ids) if chat_ids is not None else self._chat_ids
+        for chat_id in targets:
             payload: dict = {
                 "chat_id": chat_id,
                 "text": text,
@@ -189,7 +200,8 @@ class TelegramNotifier:
             f"Accounts: {len(account_labels)}\n"
             f"Watching: {accounts}\n"
             f"Alerts: open + close\n"
-            f"Open-alert Seen remind: every {int(self._ack_remind_seconds)}s"
+            f"Open-alert Seen remind: every {int(self._ack_remind_seconds)}s\n"
+            f"\nCommands: /ping /status /help"
         )
 
     def send_test_message(self) -> bool:
@@ -200,9 +212,12 @@ class TelegramNotifier:
         )
         return bool(refs)
 
-    def process_acknowledgements(self) -> None:
-        """Poll Telegram for Seen button presses."""
-        payload: dict = {"timeout": 0, "allowed_updates": ["callback_query"]}
+    def process_telegram_updates(self) -> None:
+        """Poll Telegram for Seen clicks and inbound commands (/ping, /status)."""
+        payload: dict = {
+            "timeout": 0,
+            "allowed_updates": ["callback_query", "message"],
+        }
         if self._update_offset is not None:
             payload["offset"] = self._update_offset
 
@@ -213,10 +228,58 @@ class TelegramNotifier:
         for update in result:
             update_id = int(update["update_id"])
             self._update_offset = update_id + 1
+
             callback = update.get("callback_query")
-            if not callback:
+            if callback:
+                self._handle_callback(callback)
                 continue
-            self._handle_callback(callback)
+
+            message = update.get("message")
+            if message:
+                self._handle_command_message(message)
+
+    # Backwards-compatible alias used by main loop
+    def process_acknowledgements(self) -> None:
+        self.process_telegram_updates()
+
+    def _handle_command_message(self, message: dict) -> None:
+        chat = message.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
+        if chat_id not in self._allowed_chat_ids:
+            return
+
+        text = str(message.get("text") or "").strip()
+        if not text:
+            return
+
+        # Support "/status@BotName" form
+        command = text.split()[0].split("@", 1)[0].lower()
+        if command in {"/ping", "ping"}:
+            self.send_message(
+                f"pong\nMonitor alive\nTime: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                chat_ids=[chat_id],
+            )
+            return
+
+        if command in {"/status", "/health", "status", "health"}:
+            report = (
+                self._status_provider()
+                if self._status_provider
+                else "Status provider not ready yet."
+            )
+            self.send_message(report, chat_ids=[chat_id])
+            return
+
+        if command in {"/help", "help", "/start"}:
+            self.send_message(
+                "MT5 Monitor commands:\n"
+                "/ping — quick alive check (Telegram path)\n"
+                "/status — full health (Telegram + MT5 + accounts)\n"
+                "/help — this message\n"
+                "\nOpen-trade alerts include a ✅ Seen button.",
+                chat_ids=[chat_id],
+            )
+            return
 
     def _handle_callback(self, callback: dict) -> None:
         data = str(callback.get("data", ""))

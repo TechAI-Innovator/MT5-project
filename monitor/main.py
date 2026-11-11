@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from config import AccountConfig, Settings, load_settings
 from monitor.instance_lock import acquire_lock, release_lock
@@ -39,9 +40,64 @@ class TradeMonitor:
         self._running = True
         self._reconnect_delay = 5
         self._max_reconnect_delay = 60
+        self._started_at = time.time()
+        self._last_cycle_at: float | None = None
+        self._last_cycle_ok_accounts = 0
+        self._poll_count = 0
+        self.notifier.set_status_provider(self.build_status_report)
 
     def stop(self) -> None:
         self._running = False
+
+    def build_status_report(self) -> str:
+        """Full health report for Telegram /status command."""
+        now = time.time()
+        uptime_min = int((now - self._started_at) / 60)
+        last_cycle = (
+            f"{int(now - self._last_cycle_at)}s ago"
+            if self._last_cycle_at is not None
+            else "not yet"
+        )
+
+        mt5_ok = self.mt5.is_connected
+        terminal_line = "MT5 terminal: disconnected"
+        account_line = "Active MT5 login: n/a"
+        if mt5_ok:
+            try:
+                import MetaTrader5 as mt5
+
+                term = mt5.terminal_info()
+                acc = mt5.account_info()
+                if term:
+                    terminal_line = f"MT5 terminal: connected ({term.name})"
+                if acc:
+                    account_line = f"Active MT5 login: {acc.login} ({acc.server})"
+            except Exception as exc:
+                terminal_line = f"MT5 terminal: error ({exc})"
+
+        pending = sum(
+            1 for a in self.notifier._pending.values() if not a.acknowledged
+        )
+        account_names = ", ".join(
+            f"{a.label} ({a.login})" for a in self._active_accounts
+        ) or "none"
+
+        return (
+            "MT5 MONITOR STATUS\n"
+            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+            f"Uptime: {uptime_min} min\n"
+            f"Telegram: OK (command received)\n"
+            f"{terminal_line}\n"
+            f"{account_line}\n"
+            f"Configured accounts: {len(self.settings.accounts)}\n"
+            f"Watching: {len(self._active_accounts)}\n"
+            f"Accounts: {account_names}\n"
+            f"Last full poll: {last_cycle}\n"
+            f"Last poll OK logins: {self._last_cycle_ok_accounts}/{len(self._active_accounts)}\n"
+            f"Poll cycles: {self._poll_count}\n"
+            f"Pending Seen alerts: {pending}\n"
+            f"Poll interval: {self.settings.poll_interval_seconds}s"
+        )
 
     def _ensure_connection(self, account: AccountConfig | None = None) -> bool:
         terminal_path = account.terminal_path if account else None
@@ -96,10 +152,10 @@ class TradeMonitor:
         self._known_positions[account.login] = current
         return opened, closed
 
-    def _poll_account(self, account: AccountConfig) -> None:
+    def _poll_account(self, account: AccountConfig) -> bool:
         if not self.mt5.login(account):
             # Do not mutate known positions on failed/partial login
-            return
+            return False
 
         positions = self.mt5.get_open_positions()
         if positions is None:
@@ -107,7 +163,7 @@ class TradeMonitor:
                 "Skipping poll for %s — position read unreliable.",
                 account.label,
             )
-            return
+            return False
 
         opened, closed = self._detect_opened_and_closed(account, positions)
 
@@ -152,6 +208,7 @@ class TradeMonitor:
                     account.label,
                     exc,
                 )
+        return True
 
     def run(self) -> None:
         self.logger.info("MT5 Trade Monitor starting...")
@@ -196,14 +253,18 @@ class TradeMonitor:
             self.notifier.process_acknowledgements()
             self.notifier.remind_unacknowledged()
 
+            ok_logins = 0
             for account in self._active_accounts:
                 if not self._running:
                     break
-                # login() connects/switches account; no need to re-init each time
-                self._poll_account(account)
+                if self._poll_account(account):
+                    ok_logins += 1
                 self.notifier.process_acknowledgements()
 
             poll_count += 1
+            self._poll_count = poll_count
+            self._last_cycle_at = time.time()
+            self._last_cycle_ok_accounts = ok_logins
             if poll_count % 20 == 0:
                 self.logger.info("Health check: monitor running normally.")
 
